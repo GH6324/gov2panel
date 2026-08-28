@@ -66,13 +66,13 @@ func (c *ControllerV1) PayRedirection(ctx context.Context, req *v1.PayRedirectio
 // 佣金转余额
 func (c *ControllerV1) CommissionTransferBalance(ctx context.Context, req *v1.CommissionTransferBalanceReq) (res *v1.CommissionTransferBalanceRes, err error) {
 	res = &v1.CommissionTransferBalanceRes{}
-	err = service.InvitationRecords().CommissionTransferBalance(c.getUser(ctx).Id)
+	err = service.InvitationRecords().CommissionTransferBalance(ctx, c.getUser(ctx).Id)
 	return
 }
 
 // 佣金转余额
 func (c *ControllerV1) CWithdrawalBalance(ctx context.Context, req *v1.CWithdrawalBalanceReq) (res *v1.CWithdrawalBalanceRes, err error) {
 	res = &v1.CWithdrawalBalanceRes{}
-	err = service.InvitationRecords().WithdrawalBalance(c.getUser(ctx).Id)
+	err = service.InvitationRecords().WithdrawalBalance(ctx, c.getUser(ctx).Id)
 	return
 }

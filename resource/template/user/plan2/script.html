@@ -3,79 +3,100 @@
 
 <script>
     let userExclusiveDiscount = {{.user.Discount}};
-
-    let price = {{.data.Price}};
+    let basePrice = {{.data.Price}}; // 保存不被修改的原始价格
+    let price = basePrice;
     let uuid = "{{.uuid}}";
+
+    // 辅助函数：不四舍五入，直接丢弃2位后面的小数
+    function floor2(num) {
+        // 乘 100 取整后再除以 100，加上 1e-9 避免浮点数精度乘法误差（如 10.107 * 100 变成 1010.69999999）
+        return Math.floor(num * 100 + 0.0000001) / 100;
+    }
 
     $(function(){
         if (userExclusiveDiscount > 0 ) {
-            price = price - (price * userExclusiveDiscount / 100)
-            $("#zxzk_id").html("")
-            $("#zxzk_id").append(`
+            // 高精度计算专享折扣价 (11.23 * 0.9 = 10.107)
+            price = basePrice * (1 - userExclusiveDiscount / 100);
+            
+            $("#zxzk_id").html(`
             <div class="row py-3 align-items-center">
                 <div class="col-sm-3">
-                <small class="text-uppercase text-muted font-weight-bold">专享折扣</small>
+                    <small class="text-uppercase text-muted font-weight-bold">专享折扣</small>
                 </div>
                 <div class="col-sm-9">
-                <h3 class="heading-title mb-0">${userExclusiveDiscount}%</h3>
+                    <h3 class="heading-title mb-0">${userExclusiveDiscount}%</h3>
                 </div>
             </div>
-            <hr style="margin-top: 0;margin-bottom: 0;">`)
-            $("#totle_id").text(price)
+            <hr style="margin-top: 0;margin-bottom: 0;">`);
+
+            // 不四舍五入直接截断：10.107 -> 10.1
+            $("#totle_id").text(floor2(price));
         }
-        
-    })
+    });
 
     function checkCode() {
         $.ajax({
             type: "post",
             url: "/user/coupon",
-            data: {'code':$("#code_input_id").val(),'plan_id':$("#plan_id_id").val()},
+            data: {'code': $("#code_input_id").val(), 'plan_id': $("#plan_id_id").val()},
             dataType: "json",
             success: function(data) {
                 if (data.code == 0) {
-                    notify('success', "优惠码有效")
+                    notify('success', "优惠码有效");
                     
-                    let totleId = $("#totle_id")
+                    let totleId = $("#totle_id");
+                    let typeStr = "";
+                    let fhStr = "";
 
-                    let typeStr = ""
-                    let fhStr = ""
-                    if (data.data.data.type == 1) {
-                        typeStr = "金额"
-                        fhStr = "-"
-                        data.data.data.valueT = data.data.data.value
-                        let totleNumber = price - data.data.data.value
-                        totleId.html(totleNumber > 0 ?totleNumber:0)
-                    }else if (data.data.data.type == 2) {
-                        typeStr = "百分比"
-                        fhStr = ""
-                        data.data.data.valueT = data.data.data.value + "%"
-                        totleId.html(price - (price * data.data.data.value / 100)) 
+                    // 1. 始终以最原始的 basePrice 作为基准进行折扣计算，避免精度多次丢失
+                    let currentPrice = typeof basePrice !== 'undefined' ? basePrice : price;
+
+                    // 2. 先计算专享折扣后的价格（保持高精度：11.23 * 0.9 = 10.107）
+                    if (typeof userExclusiveDiscount !== 'undefined' && userExclusiveDiscount > 0) {
+                        currentPrice = currentPrice * (1 - userExclusiveDiscount / 100);
                     }
 
-                    $("#zk_id").html("")
-                    $("#zk_id").append(`
+                    // 3. 再计算优惠码折扣
+                    if (data.data.data.type == 1) { // 金额优惠
+                        typeStr = "金额";
+                        fhStr = "-";
+                        data.data.data.valueT = data.data.data.value;
+                        currentPrice = currentPrice - data.data.data.value;
+                    } else if (data.data.data.type == 2) { // 比例优惠
+                        typeStr = "百分比";
+                        fhStr = "";
+                        data.data.data.valueT = data.data.data.value + "%";
+                        // 10.107 * 0.95 = 9.60165
+                        currentPrice = currentPrice * (1 - data.data.data.value / 100);
+                    }
+
+                    // 4. 防止低于 0
+                    currentPrice = Math.max(0, currentPrice);
+
+                    // 5. 核心修改：不四舍五入直接截断（9.60165 -> 9.6）
+                    let finalPrice = floor2(currentPrice);
+                    totleId.html(finalPrice);
+
+                    // 渲染折扣 HTML 页面元素
+                    $("#zk_id").html(`
                     <div class="row py-3 align-items-center">
                         <div class="col-sm-3">
-                        <small class="text-uppercase text-muted font-weight-bold">${typeStr}折扣</small>
+                            <small class="text-uppercase text-muted font-weight-bold">${typeStr}折扣</small>
                         </div>
                         <div class="col-sm-9">
-                        <h3 class="heading-title mb-0">${fhStr} ${data.data.data.valueT}</h3>
+                            <h3 class="heading-title mb-0">${fhStr} ${data.data.data.valueT}</h3>
                         </div>
                     </div>
-                    <hr style="margin-top: 0;margin-bottom: 0;">`)
+                    <hr style="margin-top: 0;margin-bottom: 0;">`);
 
-                    $("#code_input_id").attr('disabled','disabled')
-                    $("#code_but_id").attr('disabled','disabled')
+                    $("#code_input_id").attr('disabled', 'disabled');
+                    $("#code_but_id").attr('disabled', 'disabled');
                 } else {
-                    notify('danger', data.message)
+                    notify('danger', data.message);
                 }
             },
             error: function(XMLHttpRequest, textStatus, errorThrown) {
-                notify('danger', errorThrown)
-            },
-            complete: function () {//不管成功还是失败 都会进这个函数
-                
+                notify('danger', errorThrown);
             }
         });
     }

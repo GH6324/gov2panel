@@ -16,13 +16,13 @@ import (
 	"gov2panel/internal/utils"
 	"net/url"
 	"sort"
-	"strconv"
 	"strings"
 
 	gfJson "github.com/gogf/gf/v2/encoding/gjson"
 	"github.com/gogf/gf/v2/frame/g"
 	"github.com/gogf/gf/v2/os/gctx"
 	"github.com/gogf/gf/v2/util/gconv"
+	"github.com/shopspring/decimal"
 	"github.com/tidwall/gjson"
 )
 
@@ -95,33 +95,64 @@ func (s *sPayment) GetPayUrl(ctx context.Context, res *v1.PayRedirectionReq) (ur
 	if err != nil {
 		return
 	}
-	if res.Amount < 0 {
-		err = errors.New("金额小于0，你充值你奶奶个腿")
+
+	// 1. 将原始输入的 float64 转为 Decimal（不要先 Round！）
+	rawAmount := decimal.NewFromFloat(res.Amount)
+
+	// 2. 判断小数位数是否 >= 3 位
+	// Exponent() 返回负数，-Exponent() 即为实际小数位数
+	if rawAmount.Exponent() <= -3 {
+		return "", errors.New("金额最多只能包含两位小数")
+	}
+
+	// 1. 将输入的金额转换为 Decimal 类型
+	amount := rawAmount.RoundFloor(2)
+
+	// 金额校验
+	if amount.IsNegative() || amount.IsZero() {
+		err = errors.New("金额小于等于0，你充值你奶奶个腿")
 		return
 	}
-	res.Amount = utils.Decimal(res.Amount) //只保留两位小数
 
-	HandlingFeeAmount := 0.00 //手续费金额
-	//计算手续费
-	if payment.HandlingFeePercent > 0 { //百分比手续费
-		HandlingFeeAmount = res.Amount * float64(payment.HandlingFeePercent) / 100
-		HandlingFeeAmount = utils.Decimal(HandlingFeeAmount)
+	// 2. 手续费计算（初始化为 0）
+	handlingFeeAmount := decimal.NewFromInt(0)
+
+	// 计算百分比手续费
+	if payment.HandlingFeePercent > 0 {
+		feePercent := decimal.NewFromFloat(float64(payment.HandlingFeePercent))
+		// handlingFeeAmount = amount * payment.HandlingFeePercent / 100
+		percentFee := amount.Mul(feePercent).Div(decimal.NewFromInt(100))
+		handlingFeeAmount = handlingFeeAmount.Add(percentFee)
 	}
 
-	if payment.HandlingFeeFixed > 0 { //固定手续费
-		HandlingFeeAmount = HandlingFeeAmount + payment.HandlingFeeFixed
-		HandlingFeeAmount = utils.Decimal(HandlingFeeAmount)
+	// 计算固定手续费
+	if payment.HandlingFeeFixed > 0 {
+		fixedFee := decimal.NewFromFloat(payment.HandlingFeeFixed)
+		handlingFeeAmount = handlingFeeAmount.Add(fixedFee)
 	}
 
-	transactionId := utils.RechargeOrderNo(res.Amount+HandlingFeeAmount, res.Amount, payment.Id, service.User().GetCtxUser(ctx).Id) //订单号 系统用
+	// 手续费统一四舍五入保留 2 位小数
+	handlingFeeAmount = handlingFeeAmount.RoundFloor(2)
 
-	payAmountStr := strconv.FormatFloat(res.Amount+HandlingFeeAmount, 'f', 2, 64) //支付金额
-	// 2. 再将字符串解析回 float64
-	payAmount, err := strconv.ParseFloat(payAmountStr, 64)
-	if err != nil {
-		// 处理错误
-		return
-	}
+	// 3. 计算实际需要支付的总金额（用户充值得到的金额 + 手续费）
+	totalPayAmount := amount.Add(handlingFeeAmount).RoundFloor(2)
+
+	// 4. 转换回 float64 或 string 供后续业务逻辑使用
+	// 用户实际获得的金额 string
+	userGetAmountStr := amount.StringFixed(2)
+
+	// 实际需要支付的总金额 string（如 "2.53"）
+	payAmountStr := totalPayAmount.StringFixed(2)
+
+	// 充值订单生成 时间戳-充值金额(实际支付的)-用户得到金额-payID-用户ID
+	transactionId := utils.RechargeOrderNo(
+		payAmountStr,
+		userGetAmountStr,
+		payment.Id,
+		service.User().GetCtxUser(ctx).Id,
+	)
+
+	fmt.Println(transactionId, "-----------")
 
 	switch payment.Payment {
 	case "epay":
@@ -158,7 +189,7 @@ func (s *sPayment) GetPayUrl(ctx context.Context, res *v1.PayRedirectionReq) (ur
 			url.QueryEscape(payment.NotifyDomain+"/pay/e_pay_notify"),
 			transactionId,
 			url.QueryEscape(payment.NotifyDomain+"/user/wallet"),
-			strconv.FormatFloat((res.Amount+HandlingFeeAmount)*100, 'f', 2, 64),
+			payAmountStr,
 		)
 
 		urlStr = urlStr + fmt.Sprintf("&sign=%s", utils.MD5V(urlStr, alphaConfig.AppSecret.String()))
@@ -186,7 +217,7 @@ func (s *sPayment) GetPayUrl(ctx context.Context, res *v1.PayRedirectionReq) (ur
 			"order_id":     transactionId,                                    //商户订单编号（唯一标识）
 			"notify_url":   payment.NotifyDomain + "/pay/bepusdt_pay_notify", //支付结果异步回调地址
 			"redirect_url": res.Redirect + "/user/wallet",                    //支付成功后商户跳转地址
-			"amount":       payAmount,                                        //支付金额（法币金额）；留空或传 0 则进入地址独占模式，收到任意金额均触发回调
+			"amount":       payAmountStr,                                     //支付金额（法币金额）；留空或传 0 则进入地址独占模式，收到任意金额均触发回调
 			"name":         transactionId,                                    //商品名称
 			"timeout":      bepUsdtConfig.Timeout,                            //订单超时时间（秒），最低 120 秒
 		}
@@ -203,7 +234,6 @@ func (s *sPayment) GetPayUrl(ctx context.Context, res *v1.PayRedirectionReq) (ur
 		} else {
 			defer r.Close()
 			jsonStr := r.ReadAllString()
-			fmt.Println(jsonStr, 77777)
 			urlStr = gjson.Get(jsonStr, "data.payment_url").String()
 		}
 	default:

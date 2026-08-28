@@ -12,11 +12,11 @@ import (
 	"gov2panel/internal/model/model"
 	"gov2panel/internal/service"
 	"gov2panel/internal/utils"
-	"strconv"
 	"time"
 
 	"github.com/gogf/gf/v2/database/gdb"
 	"github.com/gogf/gf/v2/frame/g"
+	"github.com/shopspring/decimal"
 )
 
 type sPlan struct {
@@ -114,59 +114,64 @@ func (s *sPlan) GetPlanById(id int) (d *entity.V2Plan, err error) {
 }
 
 // 用户购买/续费套餐处理
-func (s *sPlan) UserBuyAndRenew(ctx context.Context, code string, plan *entity.V2Plan) (err error) {
-
+func (s *sPlan) UserBuyAndRenew(ctx context.Context, code string, plan *entity.V2Plan) error {
 	user := service.User().GetCtxUser(ctx)
 
-	//套餐最终价格
-	var price float64
-	price = plan.Price
-	var couponRes *userv1.CouponRes
+	// 1. 使用 decimal 解决精度问题
+	price := decimal.NewFromFloat(plan.Price)
 
-	//检查用户是否有专享折扣
+	// 检查用户专享折扣
 	if user.Discount > 0 {
-		price = price - (price * user.Discount / 100)
+		discount := decimal.NewFromFloat(user.Discount).Div(decimal.NewFromInt(100))
+		price = price.Mul(decimal.NewFromInt(1).Sub(discount))
 	}
 
-	//检查套餐当前用户数量
+	// 检查套餐当前用户数量
 	if plan.CapacityLimit > 0 && user.GroupId != plan.Id {
-		planUserCoun, err := service.User().GetUserCountByPlanID(plan.Id)
+		planUserCount, err := service.User().GetUserCountByPlanID(plan.Id)
 		if err != nil {
 			return err
 		}
-
-		if planUserCoun >= plan.CapacityLimit {
+		if planUserCount >= plan.CapacityLimit {
 			return errors.New("当前订阅人数达到上限！")
 		}
 	}
 
+	var couponRes *userv1.CouponRes
+	var err error
+
 	if code != "" {
-		//检查优惠码
 		couponRes, err = service.Coupon().CheckCouponCanUseByCode(ctx, &userv1.CouponReq{Code: code, PlanId: plan.Id})
 		if err != nil {
 			return err
 		}
 
+		couponValue := decimal.NewFromFloat(couponRes.Data.Value)
 		switch couponRes.Data.Type {
-		case 1: //金额优惠
-			price = (price - couponRes.Data.Value)
-		case 2: //比例优惠
-			price = price - (price * couponRes.Data.Value / 100)
+		case 1: // 金额优惠
+			price = price.Sub(couponValue)
+		case 2: // 比例优惠
+			discount := couponValue.Div(decimal.NewFromInt(100))
+			price = price.Mul(decimal.NewFromInt(1).Sub(discount))
 		}
 	}
 
-	if price < 0 {
-		price = 0
+	// 保证最终金额不小于 0，并保留 2 位小数（四舍五入）
+	if price.IsNegative() {
+		price = decimal.Zero
+	} else {
+		price = price.RoundFloor(2)
 	}
 
-	if user.Balance < price {
+	finalPriceFloat, _ := price.Float64()
+
+	if decimal.NewFromFloat(user.Balance).LessThan(price) {
 		return errors.New("余额不足，请去钱包充值")
 	}
 
-	//扣款 和 设置用户套餐
-	g.DB().Transaction(context.TODO(), func(ctx context.Context, tx gdb.TX) error {
-
-		// 扣款
+	// 2. 使用外部传入的 ctx 开启事务
+	err = g.DB().Transaction(ctx, func(ctx context.Context, tx gdb.TX) error {
+		// 扣款记录
 		err = service.RechargeRecords().SaveRechargeRecords(
 			&entity.V2RechargeRecords{
 				Amount:          plan.Price,
@@ -175,7 +180,7 @@ func (s *sPlan) UserBuyAndRenew(ctx context.Context, code string, plan *entity.V
 				ConsumptionName: plan.Name,
 			},
 			"",
-			price,
+			finalPriceFloat,
 			plan.Id,
 			code,
 		)
@@ -183,7 +188,7 @@ func (s *sPlan) UserBuyAndRenew(ctx context.Context, code string, plan *entity.V
 			return err
 		}
 
-		//添加优惠码使用记录
+		// 优惠码使用记录
 		if code != "" {
 			_, err := tx.Ctx(ctx).Insert(d.V2CouponUse.Table(), g.Map{
 				d.V2CouponUse.Columns().CouponId: couponRes.Data.Id,
@@ -195,9 +200,9 @@ func (s *sPlan) UserBuyAndRenew(ctx context.Context, code string, plan *entity.V
 			}
 		}
 
-		//为用户添加套餐 流量 过期时间 等
+		// 3. 流量与过期时间更新（修复已过期续费的时间计算 Bug）
 		var userUpData g.Map
-		switch plan.ResetTrafficMethod { //套餐类型，1 覆盖、2 叠加
+		switch plan.ResetTrafficMethod { // 1 覆盖、2 叠加
 		case 1:
 			userUpData = g.Map{
 				d.V2User.Columns().GroupId:        plan.Id,
@@ -207,22 +212,30 @@ func (s *sPlan) UserBuyAndRenew(ctx context.Context, code string, plan *entity.V
 				d.V2User.Columns().ExpiredAt:      time.Now().Add(time.Duration(plan.Expired) * 24 * time.Hour),
 			}
 		case 2:
+			// 如果已经过期，则从当前时间开始加天数，否则在原过期时间上增加
+			expiredRaw := fmt.Sprintf(
+				"DATE_ADD(IF(%s > NOW(), %s, NOW()), INTERVAL %d DAY)",
+				d.V2User.Columns().ExpiredAt,
+				d.V2User.Columns().ExpiredAt,
+				plan.Expired,
+			)
 			userUpData = g.Map{
-				d.V2User.Columns().TransferEnable: gdb.Raw(d.V2User.Columns().TransferEnable + "+" + fmt.Sprintf("%v", utils.GBToBytes(plan.TransferEnable))),
-				d.V2User.Columns().ExpiredAt:      gdb.Raw(fmt.Sprintf("DATE_ADD(%s, INTERVAL %s DAY)", d.V2User.Columns().ExpiredAt, strconv.Itoa(plan.Expired))),
+				d.V2User.Columns().TransferEnable: gdb.Raw(fmt.Sprintf("%s + %d", d.V2User.Columns().TransferEnable, utils.GBToBytes(plan.TransferEnable))),
+				d.V2User.Columns().ExpiredAt:      gdb.Raw(expiredRaw),
 			}
 		}
-		_, err = tx.Ctx(ctx).Model(d.V2User.Table()).Data(userUpData).Where(d.V2User.Columns().Id, user.Id).Update()
-		if err != nil {
-			return err
-		}
 
-		return nil
+		_, err = tx.Ctx(ctx).Model(d.V2User.Table()).Data(userUpData).Where(d.V2User.Columns().Id, user.Id).Update()
+		return err
 	})
 
-	//查询用户更新到上报缓存
-	user, _ = service.User().GetUserById(user.Id)
-	service.User().MUpUserMap(model.UserToUserTraffic(user))
+	if err != nil {
+		return err
+	}
 
-	return
+	// 更新缓存
+	updatedUser, _ := service.User().GetUserById(user.Id)
+	service.User().MUpUserMap(model.UserToUserTraffic(updatedUser))
+
+	return nil
 }

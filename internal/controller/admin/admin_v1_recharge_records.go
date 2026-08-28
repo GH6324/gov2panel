@@ -8,6 +8,7 @@ import (
 	"gov2panel/internal/utils"
 
 	"github.com/gogf/gf/v2/frame/g"
+	"github.com/gogf/gf/v2/util/gconv"
 )
 
 func (c *ControllerV1) RechargeRecords(ctx context.Context, req *v1.RechargeRecordsReq) (res *v1.RechargeRecordsRes, err error) {
@@ -26,7 +27,7 @@ func (c *ControllerV1) RechargeRecords(ctx context.Context, req *v1.RechargeReco
 }
 
 func (c *ControllerV1) RechargeRecordsAdd(ctx context.Context, req *v1.RechargeRecordsAddReq) (res *v1.RechargeRecordsAddRes, err error) {
-	req.V2RechargeRecords.TransactionId = utils.RechargeOrderNo(req.V2RechargeRecords.Amount, req.V2RechargeRecords.Amount, 0, req.UserId)
+	req.V2RechargeRecords.TransactionId = utils.RechargeOrderNo(gconv.String(req.V2RechargeRecords.Amount), gconv.String(req.V2RechargeRecords.Amount), 0, req.UserId)
 	err = service.RechargeRecords().SaveRechargeRecords(&req.V2RechargeRecords, "admin", req.Amount, 0, "")
 	return res, err
 }

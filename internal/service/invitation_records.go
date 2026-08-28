@@ -6,6 +6,7 @@
 package service
 
 import (
+	"context"
 	v1 "gov2panel/api/admin/v1"
 	"gov2panel/internal/model/entity"
 	"gov2panel/internal/model/model"
@@ -28,9 +29,10 @@ type (
 		// 审核状态
 		AdminiUpStateById(id int, state int) (err error)
 		// CommissionTransferBalance佣金转余额
-		CommissionTransferBalance(userId int) (err error)
+		CommissionTransferBalance(ctx context.Context, userId int) (err error)
 		// 佣金提现
-		WithdrawalBalance(userId int) (err error)
+		// 佣金提现
+		WithdrawalBalance(ctx context.Context, userId int) (err error)
 	}
 )
 

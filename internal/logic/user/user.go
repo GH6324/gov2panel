@@ -27,6 +27,7 @@ import (
 	"github.com/gogf/gf/v2/os/gctx"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
 )
 
 type sUser struct {
@@ -78,6 +79,11 @@ func (s *sUser) GetUserCTypeAndCRate(user *entity.V2User) (commissionType int, c
 // 用户
 // 金额
 func (s *sUser) CalculateUserCommission(CType, CRate int, fromUserId int, val float64) (commission float64, err error) {
+	// 1. 参数防御性校验
+	if val <= 0 || CRate < 0 || CRate > 100 {
+		return 0, errors.New("invalid amount or commission rate")
+	}
+
 	if CType == 2 { // 一次性的，判断是否已经有过佣金
 		invitationRecords, err := service.InvitationRecords().GetOneByFromUserId(fromUserId)
 		if utils.IgnoreErrNoRows(err) != nil {
@@ -90,10 +96,16 @@ func (s *sUser) CalculateUserCommission(CType, CRate int, fromUserId int, val fl
 
 	}
 
-	//计算佣金
-	commission = utils.Decimal(val * float64(CRate) / 100)
+	// 3. 高精度计算佣金：val * (CRate / 100)
+	valDec := decimal.NewFromFloat(val)
+	rateDec := decimal.NewFromInt(int64(CRate)).Div(decimal.NewFromInt(100))
 
-	return
+	// 保留 2 位小数并向下截断/四舍五入（根据实际业务规则决定，如 RoundBanker / RoundFloor）
+	commissionDec := valDec.Mul(rateDec).RoundFloor(2)
+
+	commission, _ = commissionDec.Float64()
+	return commission, nil
+
 }
 
 // 更新

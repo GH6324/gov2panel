@@ -223,67 +223,71 @@ func (s *sInvitationRecords) AdminiUpStateById(id, state int) (err error) {
 }
 
 // CommissionTransferBalance佣金转余额
-func (s *sInvitationRecords) CommissionTransferBalance(userId int) (err error) {
-	user, err := service.User().GetUserByIdAndCheck(userId)
-	if err != nil {
-		return err
-	}
+func (s *sInvitationRecords) CommissionTransferBalance(ctx context.Context, userId int) (err error) {
+	return g.DB().Transaction(ctx, func(ctx context.Context, tx gdb.TX) error {
+		// 1. 事务内加排他锁查询最新用户数据，防止并发问题
+		var user *entity.V2User
+		err := tx.Model(d.V2User.Table()).
+			Where(d.V2User.Columns().Id, userId).
+			LockUpdate().
+			Scan(&user)
+		if err != nil {
+			return err
+		}
 
-	if user.CommissionBalance <= 0 {
-		return errors.New("佣金为0，无法转余额")
-	}
+		if user == nil {
+			return errors.New("用户不存在")
+		}
 
-	g.DB().Transaction(context.TODO(), func(ctx context.Context, tx gdb.TX) error {
+		// 2. 严格校验金额
+		transferAmount := user.CommissionBalance
+		if transferAmount <= 0 {
+			return errors.New("佣金余额不足，无法转入")
+		}
 
-		//余额 记录
+		// 3. 写入充值/转换记录
 		rr := &entity.V2RechargeRecords{
-			Amount:          user.CommissionBalance,
+			Amount:          transferAmount,
 			UserId:          user.Id,
 			OperateType:     1,
 			RechargeName:    "佣金转余额",
 			ConsumptionName: "",
 			Remarks:         "",
-			TransactionId:   utils.RechargeOrderNo(user.CommissionBalance, user.CommissionBalance, 0, userId),
+			// 注意：若 transferAmount 为 float，建议格式化为固定 2 位小数的字符串，如 fmt.Sprintf("%.2f", transferAmount)
+			TransactionId: utils.RechargeOrderNo(fmt.Sprintf("%.2f", transferAmount), fmt.Sprintf("%.2f", transferAmount), 0, userId),
 		}
-		_, err = tx.Ctx(ctx).Model(d.V2RechargeRecords.Table()).Save(rr)
-		if err != nil {
+		if _, err = tx.Model(d.V2RechargeRecords.Table()).Save(rr); err != nil {
 			return err
 		}
 
-		//用户 aff佣金清0
-		_, err = tx.Ctx(ctx).
-			Model(d.V2User.Table()).
-			Data(g.Map{d.V2User.Columns().CommissionBalance: 0}).
+		// 4. 原子更新：清空佣金并同时累加余额（带有条件比较，防并发超扣）
+		res, err := tx.Model(d.V2User.Table()).
 			Where(d.V2User.Columns().Id, user.Id).
+			Where(d.V2User.Columns().CommissionBalance, transferAmount). // 条件匹配防并发
+			Data(g.Map{
+				d.V2User.Columns().CommissionBalance: 0,
+				d.V2User.Columns().Balance:           gdb.Raw(fmt.Sprintf("%s + %v", d.V2User.Columns().Balance, transferAmount)),
+			}).
 			Update()
 		if err != nil {
 			return err
 		}
 
-		//用户 余额加佣金
-		_, err = tx.Ctx(ctx).
-			Model(d.V2User.Table()).
-			Where(d.V2User.Columns().Id, user.Id).
-			Increment(d.V2User.Columns().Balance, user.CommissionBalance)
-		if err != nil {
-			return err
+		affected, _ := res.RowsAffected()
+		if affected == 0 {
+			return errors.New("操作失败，账户金额发生变动，请重试")
 		}
 
 		return nil
 	})
-
-	return
 }
 
 // 佣金提现
-func (s *sInvitationRecords) WithdrawalBalance(userId int) (err error) {
+// 佣金提现
+func (s *sInvitationRecords) WithdrawalBalance(ctx context.Context, userId int) (err error) {
 	user, err := service.User().GetUserByIdAndCheck(userId)
 	if err != nil {
 		return err
-	}
-
-	if user.CommissionBalance <= 0 {
-		return errors.New("佣金为0，无法提现")
 	}
 
 	setting, err := service.Setting().GetSettingAllMap()
@@ -291,15 +295,41 @@ func (s *sInvitationRecords) WithdrawalBalance(userId int) (err error) {
 		return err
 	}
 
-	if user.CommissionBalance < setting["minimum_withdrawal_balance"].Float64() {
+	minBalance := setting["minimum_withdrawal_balance"].Float64()
+	if user.CommissionBalance < minBalance {
 		return errors.New("佣金低于最低提现额度，最低提现额度：" + setting["minimum_withdrawal_balance"].String())
 	}
 
-	g.DB().Transaction(context.TODO(), func(ctx context.Context, tx gdb.TX) error {
+	// 接收事务执行的 error
+	err = g.DB().Transaction(ctx, func(ctx context.Context, tx gdb.TX) error {
 
-		//邀请收入记录
+		// 1. 原子更新：只有当余额大于等于最低限制且满足原余额时才清零
+		// 这样即使有多个并发请求，也只有一个请求能够成功 Update 影响行数大于 0
+		res, err := tx.Ctx(ctx).
+			Model(d.V2User.Table()).
+			Data(g.Map{
+				d.V2User.Columns().CommissionBalance: 0,
+			}).
+			Where(d.V2User.Columns().Id, user.Id).
+			Where(d.V2User.Columns().CommissionBalance+" >= ?", minBalance). // 条件锁定
+			Update()
+
+		if err != nil {
+			return err
+		}
+
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if affected == 0 {
+			// 说明余额已被其他并发请求扣减，直接阻断
+			return errors.New("提现失败，余额不足或已被处理")
+		}
+
+		// 2. 写入邀请收入扣减记录
 		ir := &entity.V2InvitationRecords{
-			Amount:            -user.CommissionBalance, //用户aff余额
+			Amount:            -user.CommissionBalance,
 			UserId:            user.Id,
 			FromUserId:        0,
 			CommissionRate:    0,
@@ -307,22 +337,12 @@ func (s *sInvitationRecords) WithdrawalBalance(userId int) (err error) {
 			OperateType:       2,
 			State:             -1,
 		}
-		_, err := tx.Ctx(ctx).Model(d.V2InvitationRecords.Table()).Save(ir)
+		_, err = tx.Ctx(ctx).Model(d.V2InvitationRecords.Table()).Save(ir)
 		if err != nil {
 			return err
 		}
 
-		//用户 aff佣金清0
-		_, err = tx.Ctx(ctx).
-			Model(d.V2User.Table()).
-			Data(g.Map{d.V2User.Columns().CommissionBalance: 0}).
-			Where(d.V2User.Columns().Id, user.Id).
-			Update()
-		if err != nil {
-			return err
-		}
-
-		//创建一个[提现工单]
+		// 3. 创建提现工单
 		_, err = tx.Ctx(ctx).
 			Model(d.V2Ticket.Table()).
 			Save(&entity.V2Ticket{
@@ -339,5 +359,5 @@ func (s *sInvitationRecords) WithdrawalBalance(userId int) (err error) {
 		return nil
 	})
 
-	return
+	return err
 }
